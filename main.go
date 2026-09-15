@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -16,7 +17,7 @@ import (
 )
 
 const pluginName = "cpa-devin-compat"
-const pluginVersion = "0.1.0"
+const pluginVersion = "0.2.0"
 
 type config struct {
 	Enabled bool     `yaml:"enabled"`
@@ -81,7 +82,27 @@ func matchModel(c *config, models ...string) bool {
 	return false
 }
 
-func handleMethod(method string, raw []byte) ([]byte, error) {
+// handleMethod 是 C ABI 的入口。插件以动态库形式跑在 CPA 进程里，这里的 panic 会直接拖垮宿主，
+// 所以统一兜底：拦截类调用出错时返回空结果（宿主按"不修改"处理），注册类调用返回错误。
+func handleMethod(method string, raw []byte) (out []byte, err error) {
+	return withRecover(method, func() ([]byte, error) { return dispatch(method, raw) })
+}
+
+func withRecover(method string, fn func() ([]byte, error)) (out []byte, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Fprintf(os.Stderr, "[%s] recovered panic method=%s: %v\n", pluginName, method, r)
+			if method == pluginabi.MethodPluginRegister || method == pluginabi.MethodPluginReconfigure {
+				out, err = nil, fmt.Errorf("plugin panic during %s", method)
+				return
+			}
+			out, err = okEnvelope(struct{}{})
+		}
+	}()
+	return fn()
+}
+
+func dispatch(method string, raw []byte) ([]byte, error) {
 	switch method {
 	case pluginabi.MethodPluginRegister, pluginabi.MethodPluginReconfigure:
 		return register(raw)
@@ -112,7 +133,8 @@ func handleMethod(method string, raw []byte) ([]byte, error) {
 
 func register(raw []byte) ([]byte, error) {
 	var request struct {
-		ConfigYAML []byte `json:"config_yaml"`
+		ConfigYAML    []byte `json:"config_yaml"`
+		SchemaVersion uint32 `json:"schema_version"`
 	}
 	if len(raw) > 0 {
 		if err := json.Unmarshal(raw, &request); err != nil {
@@ -128,6 +150,9 @@ func register(raw []byte) ([]byte, error) {
 		c.SessionHeader = defaultConfig().SessionHeader
 	}
 	settings.Store(&c)
+	if request.SchemaVersion != 0 && request.SchemaVersion != pluginabi.SchemaVersion {
+		logf("host schema_version=%d 与编译时 %d 不同：插件协议可能已变化，请确认日志中修补仍按预期工作", request.SchemaVersion, pluginabi.SchemaVersion)
+	}
 	return okEnvelope(struct {
 		SchemaVersion uint32             `json:"schema_version"`
 		Metadata      pluginapi.Metadata `json:"metadata"`
@@ -158,14 +183,14 @@ func interceptRequest(c *config, req pluginapi.RequestInterceptRequest) pluginap
 		return resp
 	}
 	body := req.Body
-	if c.FlattenNamespaceTools && sameFormat(req.SourceFormat, sdktranslator.FormatOpenAIResponse) {
+	if c.FlattenNamespaceTools && mayCarryResponses(req.SourceFormat) {
 		if out, namespaces, tools := flattenNamespaceTools(body); namespaces > 0 {
 			body = out
 			resp.Body = out
 			logf("namespace-flatten model=%s namespaces=%d tools=%d", firstNonEmpty(req.RequestedModel, req.Model), namespaces, tools)
 		}
 	}
-	if c.SessionPin {
+	if c.SessionPin && req.Headers.Get(c.SessionHeader) == "" {
 		if id := pinnedSessionID(req.Headers, body, req.Metadata, req.SourceFormat); id != "" {
 			resp.Headers = http.Header{}
 			resp.Headers.Set(c.SessionHeader, id)
@@ -183,7 +208,7 @@ func interceptResponse(c *config, req pluginapi.ResponseInterceptRequest) plugin
 	if req.StatusCode != 0 && (req.StatusCode < 200 || req.StatusCode >= 300) {
 		return resp
 	}
-	if !sameFormat(req.SourceFormat, sdktranslator.FormatOpenAIResponse) {
+	if !isResponsesPayload(req.SourceFormat, req.Body) {
 		return resp
 	}
 	if out, fixes := patchResponsesObject(req.Body); fixes > 0 {
@@ -199,11 +224,11 @@ func interceptStreamChunk(c *config, req pluginapi.StreamChunkInterceptRequest) 
 		return resp
 	}
 	switch {
-	case c.FixResponses && sameFormat(req.SourceFormat, sdktranslator.FormatOpenAIResponse):
+	case c.FixResponses && isResponsesPayload(req.SourceFormat, req.Body):
 		if out, changed := patchResponsesChunk(req.RequestID, req.Body); changed {
 			resp.Body = out
 		}
-	case c.NormalizeChatToolIndex && sameFormat(req.SourceFormat, sdktranslator.FormatOpenAI):
+	case c.NormalizeChatToolIndex && isChatPayload(req.SourceFormat, req.Body):
 		if out, changed := normalizeChatChunk(req.RequestID, req.Body); changed {
 			resp.Body = out
 		}
@@ -213,6 +238,43 @@ func interceptStreamChunk(c *config, req pluginapi.StreamChunkInterceptRequest) 
 
 func sameFormat(value string, format sdktranslator.Format) bool {
 	return strings.EqualFold(strings.TrimSpace(value), format.String())
+}
+
+// knownFormats 是编译时 SDK 已知的协议格式名。宿主给出不在此列的格式名时（例如以后改名），
+// 改为按内容识别协议，避免修补因为标签对不上而静默失效；已知的其他协议一律不碰。
+var knownFormats = []sdktranslator.Format{
+	sdktranslator.FormatOpenAI, sdktranslator.FormatOpenAIResponse, sdktranslator.FormatClaude,
+	sdktranslator.FormatGemini, sdktranslator.FormatCodex, sdktranslator.FormatAntigravity,
+	sdktranslator.FormatInteractions,
+}
+
+func isKnownFormat(value string) bool {
+	for _, f := range knownFormats {
+		if sameFormat(value, f) {
+			return true
+		}
+	}
+	return false
+}
+
+// mayCarryResponses 判断请求体可能是 OpenAI Responses 协议（含改名后的未知格式名）。
+func mayCarryResponses(format string) bool {
+	return sameFormat(format, sdktranslator.FormatOpenAIResponse) || !isKnownFormat(format)
+}
+
+func isResponsesPayload(format string, body []byte) bool {
+	if sameFormat(format, sdktranslator.FormatOpenAIResponse) {
+		return true
+	}
+	return !isKnownFormat(format) &&
+		(bytes.Contains(body, []byte(`"type":"response.`)) || bytes.Contains(body, []byte(`"object":"response"`)))
+}
+
+func isChatPayload(format string, body []byte) bool {
+	if sameFormat(format, sdktranslator.FormatOpenAI) {
+		return true
+	}
+	return !isKnownFormat(format) && bytes.Contains(body, []byte(`"object":"chat.completion.chunk"`))
 }
 
 func firstNonEmpty(values ...string) string {

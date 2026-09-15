@@ -235,3 +235,138 @@ func TestNormalizeChatToolIndex(t *testing.T) {
 		t.Fatalf("chat state must be dropped after finish_reason")
 	}
 }
+
+// 以下用例模拟 CPA 官方修复后的输出：插件必须原样放行，不能重复修补或改坏。
+
+func streamBody(t *testing.T, format, requestID string, chunkIndex int, body []byte) []byte {
+	t.Helper()
+	var resp pluginapi.StreamChunkInterceptResponse
+	call(t, pluginabi.MethodResponseInterceptStreamChunk, pluginapi.StreamChunkInterceptRequest{
+		RequestID: requestID, SourceFormat: format, RequestedModel: "devin/swe-2", Body: body, ChunkIndex: chunkIndex,
+	}, &resp)
+	return resp.Body
+}
+
+func TestUpstreamFixedResponsesPassThrough(t *testing.T) {
+	resetConfig()
+	events := [][]byte{
+		sse("response.created", `{"type":"response.created","response":{"id":"r","object":"response","created_at":1,"status":"in_progress","model":"devin/swe-2","output":[]}}`),
+		sse("response.output_item.added", `{"type":"response.output_item.added","output_index":0,"item":{"id":"rs_up","type":"reasoning","summary":[]}}`),
+		sse("response.reasoning_summary_text.delta", `{"type":"response.reasoning_summary_text.delta","item_id":"rs_up","output_index":0,"summary_index":2,"delta":"t"}`),
+		sse("response.output_item.done", `{"type":"response.output_item.done","output_index":1,"item":{"id":"fc_up","type":"function_call","call_id":"c","name":"bash","arguments":"{}","status":"incomplete"}}`),
+		sse("response.completed", `{"type":"response.completed","response":{"id":"r","object":"response","created_at":1,"status":"completed","model":"devin/swe-2","output":[{"id":"fc_up","type":"function_call","call_id":"c","name":"bash","arguments":"{}","status":"completed"},{"id":"msg_up","type":"message","status":"completed","content":[{"type":"output_text","text":"ok","annotations":[]}]}]}}`),
+	}
+	for i, ev := range events {
+		if out := streamBody(t, "openai-response", "fixed-1", i, ev); len(out) != 0 {
+			t.Fatalf("event %d must pass through untouched, got %s", i, out)
+		}
+	}
+	var resp pluginapi.ResponseInterceptResponse
+	call(t, pluginabi.MethodResponseInterceptAfter, pluginapi.ResponseInterceptRequest{
+		SourceFormat: "openai-response", RequestedModel: "devin/swe-2", StatusCode: 200,
+		Body: []byte(`{"id":"r","object":"response","created_at":1,"output":[{"id":"rs","type":"reasoning","summary":[]},{"id":"m","type":"message","status":"completed","content":[{"type":"output_text","text":"ok","annotations":[]}]}]}`),
+	}, &resp)
+	if len(resp.Body) != 0 {
+		t.Fatalf("compliant non-stream response must pass through, got %s", resp.Body)
+	}
+	for _, feature := range []string{"response.created_at", "reasoning_summary.item_id", "function_call.status", "message.annotations"} {
+		if _, ok := nativeSeen.Load(feature); !ok {
+			t.Fatalf("native feature %s not detected", feature)
+		}
+	}
+}
+
+func TestUpstreamFixedChatIndexPassThrough(t *testing.T) {
+	resetConfig()
+	for i, body := range []string{
+		`{"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"a","function":{"name":"x","arguments":""}}]},"finish_reason":null}]}`,
+		`{"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"b","function":{"name":"y","arguments":""}}]},"finish_reason":null}]}`,
+		`{"object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+	} {
+		if out := streamBody(t, "openai", "fixed-chat", i, []byte(body)); len(out) != 0 {
+			t.Fatalf("contiguous indexes must pass through, got %s", out)
+		}
+	}
+}
+
+func TestInvalidJSONPassThrough(t *testing.T) {
+	resetConfig()
+	broken := []byte("event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":")
+	if out := streamBody(t, "openai-response", "broken-1", 0, broken); len(out) != 0 {
+		t.Fatalf("invalid JSON must pass through, got %s", out)
+	}
+	if out, _ := patchResponsesObject([]byte(`not json`)); string(out) != "not json" {
+		t.Fatalf("invalid non-stream body must be returned as-is")
+	}
+}
+
+func TestPanicIsRecovered(t *testing.T) {
+	out, err := withRecover(pluginabi.MethodResponseInterceptStreamChunk, func() ([]byte, error) { panic("boom") })
+	if err != nil || !strings.Contains(string(out), `"ok":true`) {
+		t.Fatalf("intercept panic must degrade to pass-through, out=%s err=%v", out, err)
+	}
+	if _, err := withRecover(pluginabi.MethodPluginRegister, func() ([]byte, error) { panic("boom") }); err == nil {
+		t.Fatalf("register panic must surface as error")
+	}
+}
+
+func TestRenamedFormatStillPatched(t *testing.T) {
+	resetConfig()
+	body := sse("response.created", `{"type":"response.created","response":{"id":"r","object":"response","status":"in_progress","model":"devin/swe-2","output":[]}}`)
+	out := streamBody(t, "openai-responses-v2", "renamed-1", 0, body)
+	if !gjson.Get(string(out[strings.Index(string(out), "{"):]), "response.created_at").Exists() {
+		t.Fatalf("unknown format label must fall back to content detection, got %q", out)
+	}
+	// 已知的其他协议即使内容里有相似字样也不碰。
+	if out := streamBody(t, "claude", "renamed-2", 0, body); len(out) != 0 {
+		t.Fatalf("known non-responses format must be ignored")
+	}
+}
+
+func TestChatGuards(t *testing.T) {
+	resetConfig()
+	chunk := `{"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":3,"id":"a","function":{"name":"x","arguments":""}}]},"finish_reason":null}]}`
+	if out := streamBody(t, "openai", "", 0, []byte(chunk)); len(out) != 0 {
+		t.Fatalf("empty RequestID must not normalize indexes")
+	}
+	two := `{"object":"chat.completion.chunk","choices":[` +
+		`{"index":0,"delta":{"tool_calls":[{"index":2,"id":"a","function":{"name":"x","arguments":""}}]},"finish_reason":null},` +
+		`{"index":1,"delta":{"tool_calls":[{"index":5,"id":"b","function":{"name":"y","arguments":""}}]},"finish_reason":null}]}`
+	out := gjson.ParseBytes(streamBody(t, "openai", "multi-choice", 0, []byte(two)))
+	if out.Get("choices.0.delta.tool_calls.0.index").Int() != 0 || out.Get("choices.1.delta.tool_calls.0.index").Int() != 0 {
+		t.Fatalf("each choice must be numbered independently: %s", out.Raw)
+	}
+}
+
+func TestSessionPinRespectsConfiguredHeader(t *testing.T) {
+	resetConfig()
+	c := *settings.Load()
+	c.SessionHeader = "X-Devin-Session"
+	settings.Store(&c)
+	defer resetConfig()
+	req := pluginapi.RequestInterceptRequest{SourceFormat: "openai", RequestedModel: "devin/swe-2", Body: chatBody(),
+		Headers: http.Header{"X-Devin-Session": {"client-provided"}}}
+	var resp pluginapi.RequestInterceptResponse
+	call(t, pluginabi.MethodRequestInterceptBefore, req, &resp)
+	if len(resp.Headers) != 0 {
+		t.Fatalf("existing configured header must not be overridden: %v", resp.Headers)
+	}
+}
+
+func TestStateEvictionBounded(t *testing.T) {
+	old := maxStreamStates
+	maxStreamStates = 3
+	defer func() { maxStreamStates = old }()
+	statesMu.Lock()
+	states = make(map[string]*streamState)
+	statesMu.Unlock()
+	for i := 0; i < 10; i++ {
+		withState("s"+string(rune('a'+i)), func(*streamState) {})
+	}
+	statesMu.Lock()
+	n := len(states)
+	statesMu.Unlock()
+	if n > 3 {
+		t.Fatalf("state map must stay bounded, got %d", n)
+	}
+}

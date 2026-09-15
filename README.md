@@ -41,7 +41,7 @@ plugins:
 
 ```bash
 CGO_ENABLED=1 go build -trimpath -buildvcs=false -buildmode=c-shared \
-  -ldflags="-s -w" -o cpa-devin-compat-v0.1.0.so .
+  -ldflags="-s -w" -o cpa-devin-compat-v0.2.0.so .
 ```
 
 把生成的 `.so` 放到 CPA 的插件目录 `plugins/linux/amd64/`（相对 CPA 工作目录），再在配置里加上插件条目。首次加入配置会热加载；替换同名插件的新版本需要重启 CPA。
@@ -51,7 +51,7 @@ Docker 部署时注意把插件目录挂载到宿主机，例如 `./plugins:/CLI
 加载成功后日志里会出现：
 
 ```
-pluginhost: plugin registered plugin_id=cpa-devin-compat ... version=0.1.0
+pluginhost: plugin registered plugin_id=cpa-devin-compat ... version=0.2.0
 ```
 
 运行时日志示例：
@@ -62,11 +62,25 @@ pluginhost: plugin registered plugin_id=cpa-devin-compat ... version=0.1.0
 [cpa-devin-compat] namespace-flatten model=devin/swe-2 namespaces=1 tools=3
 ```
 
+## 兼容防护
+
+CPA 官方后续可能修复上述问题，插件按「上游修好后自动变成空操作」设计：
+
+- **只补缺失，不覆盖**：每个字段只在缺失时才写入；上游已经给出的值（哪怕与插件的默认值不同）一律保留。上游输出合规时插件不回写任何分片。
+- **上游修复可观测**：首次发现上游已原生提供某个字段时，打一条 `upstream-native feature=...` 日志（每项每进程一次）。几项都出现后，可以关掉 `fix-responses` 或卸载插件。
+- **会话头不抢占**：客户端或宿主已经给出任何会话标识，或者请求里已有 `session-header` 指定的头，就不补写。
+- **编号修正可退化**：`tool_calls.index` 已经从 0 连续编号时映射是恒等的，不会改动；按 choice 分别编号；拿不到请求 ID 时不做跨分片映射，避免撞号。
+- **协议识别兜底**：宿主格式名是 `openai-response` / `openai` 时按标签处理；如果以后改成插件不认识的格式名，改为按内容识别；已知的其他协议（claude、gemini 等）一律不碰。
+- **失败即放行**：负载不是合法 JSON、改写结果不合法、插件内部 panic 时，都原样放行请求或分片，不会拖垮 CPA 进程；插件协议版本与编译时不一致时在注册阶段打日志提醒。
+- **内存有上界**：流状态在终态事件后释放，中断的流靠 30 分钟 TTL 与数量上限淘汰。
+
 ## 测试
 
 ```bash
 go test ./...
 ```
+
+单元测试覆盖了各项修补，以及模拟官方修复后的合规输出必须原样放行、非法 JSON、panic、格式名变化、会话头已存在等防护场景。
 
 曾用隔离的 CPA v7.3.3 实例（真实 Devin 凭据）加 AI SDK 7.0.101、`@ai-sdk/openai` 4.0.66、`@ai-sdk/openai-compatible` 3.0.48 做端到端验证：Responses 流式（`store` 为 true/false）、非流式和 chat 流式都能完成多步并行工具调用；namespace 工具返回 200；历史被改写后缓存命中从 0 提升到 8192 token。
 

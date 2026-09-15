@@ -1,0 +1,4 @@
+dist/
+*.so
+*.h
+DEPLOYMENT.md

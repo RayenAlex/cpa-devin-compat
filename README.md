@@ -35,18 +35,30 @@ plugins:
       log: true                        # 记录补写与修补次数
 ```
 
-## 构建与安装
+## 安装
 
-需要 Go 1.26 与 CGO（gcc）：
+支持 linux/amd64、linux/arm64，基于 CPA v7.3.3 构建。
+
+**方式 A：CPA 插件商店（推荐）。** CPA 插件商店只从「来源 registry」安装，本仓库自带一份 `registry.json`。在管理控制台「插件商店 → 第三方插件来源」（对应 `config.yaml` 的 `plugins.store-sources`）加入：
+
+```
+https://raw.githubusercontent.com/szxypi/cpa-devin-compat/main/registry.json
+```
+
+然后在商店里找到「Devin Compat」安装。商店会从本仓库 Release 下载 `cpa-devin-compat_<ver>_linux_<arch>.zip` 并按 `checksums.txt` 校验，安装后在 `plugins.configs` 写入 `cpa-devin-compat: { enabled: true }`。
+
+**方式 B：手动。** 从 [Releases](https://github.com/szxypi/cpa-devin-compat/releases) 下载 `cpa-devin-compat-v<ver>-linux-<arch>.so`，改名为 `cpa-devin-compat-v<ver>.so` 放到 CPA 插件目录 `plugins/linux/<arch>/`（CPA 按文件名取插件 id 和版本），再在配置里加上插件条目。首次加入配置会热加载；替换同名插件的新版本需要重启 CPA，并删掉旧版本文件。
+
+Docker 部署时注意把插件目录挂载到宿主机，例如 `./plugins:/CLIProxyAPI/plugins`，否则更新镜像、重建容器后插件会丢失。
+
+**自行构建。** 需要 Go 1.26 与 CGO（gcc）：
 
 ```bash
 CGO_ENABLED=1 go build -trimpath -buildvcs=false -buildmode=c-shared \
   -ldflags="-s -w" -o cpa-devin-compat-v0.2.0.so .
 ```
 
-把生成的 `.so` 放到 CPA 的插件目录 `plugins/linux/amd64/`（相对 CPA 工作目录），再在配置里加上插件条目。首次加入配置会热加载；替换同名插件的新版本需要重启 CPA。
-
-Docker 部署时注意把插件目录挂载到宿主机，例如 `./plugins:/CLIProxyAPI/plugins`，否则更新镜像、重建容器后插件会丢失。
+`scripts/package-release.sh` 生成插件商店格式的 Release 资产（arm64 需要 `aarch64-linux-gnu-gcc`）。
 
 加载成功后日志里会出现：
 
@@ -89,6 +101,11 @@ go test ./...
 - 全新对话首轮的大上下文冷计算发生在 Devin 上游，插件无法缩短，只能保证后续轮次命中缓存。
 - Responses 的 WebSocket 通道未做端到端测试（代码上与 HTTP 流共用同一条分片拦截路径）。
 - Codex 的 `custom` 工具（如 `apply_patch`）与 `web_search` 工具仍会被 CPA 丢弃，本插件未处理。
+
+## 更新记录
+
+- **v0.2.0**：兼容防护——只补缺失字段并记录 `upstream-native` 日志、panic 兜底放行、JSON 合法性校验、格式名改变时按内容识别、会话头已存在时不补写、chat 编号按 choice 独立、流状态设上界；提供插件商店 registry 与 Release 资产。
+- **v0.1.0**：补齐 Responses 缺失字段、无会话头时补稳定会话 ID、展开 namespace 工具、chat `tool_calls.index` 从 0 编号。
 
 ## License
 

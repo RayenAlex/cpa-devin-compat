@@ -37,23 +37,35 @@ plugins:
       log: true                        # 记录补写与修补次数
 ```
 
-## 构建与安装
+## 安装
 
-需要 Go 1.26 与 CGO（gcc）：
+支持 linux/amd64、linux/arm64，基于 CPA v7.3.3 构建。
+
+**方式 A：CPA 插件商店（推荐）。** CPA 插件商店只从「来源 registry」安装，本仓库自带一份 `registry.json`。在管理控制台「插件商店 → 第三方插件来源」（对应 `config.yaml` 的 `plugins.store-sources`）加入：
+
+```
+https://raw.githubusercontent.com/szxypi/cpa-devin-compat/main/registry.json
+```
+
+然后在商店里找到「Devin Compat」安装。商店会从本仓库 Release 下载 `cpa-devin-compat_<ver>_linux_<arch>.zip` 并按 `checksums.txt` 校验，安装后在 `plugins.configs` 写入 `cpa-devin-compat: { enabled: true }`。
+
+**方式 B：手动。** 从 [Releases](https://github.com/szxypi/cpa-devin-compat/releases) 下载 `cpa-devin-compat-v<ver>-linux-<arch>.so`，改名为 `cpa-devin-compat-v<ver>.so` 放到 CPA 插件目录 `plugins/linux/<arch>/`（CPA 按文件名取插件 id 和版本），再在配置里加上插件条目。首次加入配置会热加载；替换同名插件的新版本需要重启 CPA，并删掉旧版本文件。
+
+Docker 部署时注意把插件目录挂载到宿主机，例如 `./plugins:/CLIProxyAPI/plugins`，否则更新镜像、重建容器后插件会丢失。
+
+**自行构建。** 需要 Go 1.26 与 CGO（gcc）：
 
 ```bash
 CGO_ENABLED=1 go build -trimpath -buildvcs=false -buildmode=c-shared \
-  -ldflags="-s -w" -o cpa-devin-compat-v0.1.2.so .
+  -ldflags="-s -w" -o cpa-devin-compat-v0.2.0.so .
 ```
 
-把生成的 `.so` 放到 CPA 的插件目录 `plugins/linux/amd64/`（相对 CPA 工作目录），再在配置里加上插件条目。首次加入配置会热加载；替换同名插件的新版本需要重启 CPA。
-
-Docker 部署时注意把插件目录挂载到宿主机，例如 `./plugins:/CLIProxyAPI/plugins`，否则更新镜像、重建容器后插件会丢失。
+`scripts/package-release.sh` 生成插件商店格式的 Release 资产（arm64 需要 `aarch64-linux-gnu-gcc`）。
 
 加载成功后日志里会出现：
 
 ```
-pluginhost: plugin registered plugin_id=cpa-devin-compat ... version=0.1.2
+pluginhost: plugin registered plugin_id=cpa-devin-compat ... version=0.2.0
 ```
 
 运行时日志示例：
@@ -65,11 +77,25 @@ pluginhost: plugin registered plugin_id=cpa-devin-compat ... version=0.1.2
 [cpa-devin-compat] schema-inline model=devin/swe-2 schemas=1 refs=53
 ```
 
+## 兼容防护
+
+CPA 官方后续可能修复上述问题，插件按「上游修好后自动变成空操作」设计：
+
+- **只补缺失，不覆盖**：每个字段只在缺失时才写入；上游已经给出的值（哪怕与插件的默认值不同）一律保留。上游输出合规时插件不回写任何分片。
+- **上游修复可观测**：首次发现上游已原生提供某个字段时，打一条 `upstream-native feature=...` 日志（每项每进程一次）。几项都出现后，可以关掉 `fix-responses` 或卸载插件。
+- **会话头不抢占**：客户端或宿主已经给出任何会话标识，或者请求里已有 `session-header` 指定的头，就不补写。
+- **编号修正可退化**：`tool_calls.index` 已经从 0 连续编号时映射是恒等的，不会改动；按 choice 分别编号；拿不到请求 ID 时不做跨分片映射，避免撞号。
+- **协议识别兜底**：宿主格式名是 `openai-response` / `openai` 时按标签处理；如果以后改成插件不认识的格式名，改为按内容识别；已知的其他协议（claude、gemini 等）一律不碰。
+- **失败即放行**：负载不是合法 JSON、改写结果不合法、插件内部 panic 时，都原样放行请求或分片，不会拖垮 CPA 进程；插件协议版本与编译时不一致时在注册阶段打日志提醒。
+- **内存有上界**：流状态在终态事件后释放，中断的流靠 30 分钟 TTL 与数量上限淘汰。
+
 ## 测试
 
 ```bash
 go test ./...
 ```
+
+单元测试覆盖了各项修补，以及模拟官方修复后的合规输出必须原样放行、非法 JSON、panic、格式名变化、会话头已存在等防护场景。
 
 曾用隔离的 CPA v7.3.3 实例（真实 Devin 凭据）加 AI SDK 7.0.101、`@ai-sdk/openai` 4.0.66、`@ai-sdk/openai-compatible` 3.0.48 做端到端验证：Responses 流式（`store` 为 true/false）、非流式和 chat 流式都能完成多步并行工具调用；namespace 工具返回 200；历史被改写后缓存命中从 0 提升到 8192 token。
 
@@ -78,6 +104,11 @@ go test ./...
 - 全新对话首轮的大上下文冷计算发生在 Devin 上游，插件无法缩短，只能保证后续轮次命中缓存。
 - Responses 的 WebSocket 通道未做端到端测试（代码上与 HTTP 流共用同一条分片拦截路径）。
 - namespace 内的 Codex `custom` 工具（如 `apply_patch`）会被保留并交给 CPA v7.3.3 转换；OpenAI 原生 `web_search` 等服务端工具仍取决于 CPA/Devin 上游支持。
+
+## 更新记录
+
+- **v0.2.0**：兼容防护——只补缺失字段并记录 `upstream-native` 日志、panic 兜底放行、JSON 合法性校验、格式名改变时按内容识别、会话头已存在时不补写、chat 编号按 choice 独立、流状态设上界；提供插件商店 registry 与 Release 资产。
+- **v0.1.0**：补齐 Responses 缺失字段、无会话头时补稳定会话 ID、展开 namespace 工具、chat `tool_calls.index` 从 0 编号。
 
 ## License
 

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -14,26 +15,41 @@ import (
 
 // streamState 保存单个流式请求里跨分片需要的信息，按宿主 RequestID 索引。
 type streamState struct {
-	reasoningIDs map[int]string // output_index → reasoning 条目 id
-	chatIndexes  map[int]int    // 上游 tool_calls.index → 从 0 连续编号后的 index
+	reasoningIDs map[int]string      // output_index → reasoning 条目 id
+	chatIndexes  map[int]map[int]int // choice 下标 → (上游 tool_calls.index → 从 0 连续编号后的 index)
 	fixes        int
 	touched      time.Time
 }
 
-const (
-	maxStreamStates = 4096
-	streamStateTTL  = 30 * time.Minute
-)
+const streamStateTTL = 30 * time.Minute
 
 var (
+	// maxStreamStates 限制同时跟踪的流数量；流中断没收到终态事件时，状态靠 TTL 与淘汰回收。
+	maxStreamStates = 4096
+
 	statesMu sync.Mutex
 	states   = make(map[string]*streamState)
+
+	nativeSeen sync.Map
 )
+
+// noteNative 在首次发现上游已原生提供某项修补内容时记一条日志（每项每进程一次），
+// 方便确认 CPA 官方修复后关闭对应开关或卸载插件。修补本身只在字段缺失时才发生，
+// 上游修复后自动变成空操作，不需要人工干预。
+func noteNative(feature string) {
+	if _, loaded := nativeSeen.LoadOrStore(feature, true); !loaded {
+		logf("upstream-native feature=%s：上游已原生提供，本项修补自动跳过", feature)
+	}
+}
+
+func newStreamState() *streamState {
+	return &streamState{reasoningIDs: map[int]string{}, chatIndexes: map[int]map[int]int{}}
+}
 
 // withState 在锁内对 requestID 的状态执行 fn。requestID 为空时使用一次性状态。
 func withState(requestID string, fn func(*streamState)) {
 	if requestID == "" {
-		fn(&streamState{reasoningIDs: map[int]string{}, chatIndexes: map[int]int{}})
+		fn(newStreamState())
 		return
 	}
 	statesMu.Lock()
@@ -42,17 +58,33 @@ func withState(requestID string, fn func(*streamState)) {
 	st := states[requestID]
 	if st == nil {
 		if len(states) >= maxStreamStates {
-			for id, old := range states {
-				if now.Sub(old.touched) > streamStateTTL {
-					delete(states, id)
-				}
-			}
+			evictStates(now)
 		}
-		st = &streamState{reasoningIDs: map[int]string{}, chatIndexes: map[int]int{}}
+		st = newStreamState()
 		states[requestID] = st
 	}
 	st.touched = now
 	fn(st)
+}
+
+// evictStates 先清掉超过 TTL 的状态；仍然满额时淘汰最久未访问的一条，保证内存有上界。
+// 调用方需持有 statesMu。
+func evictStates(now time.Time) {
+	for id, old := range states {
+		if now.Sub(old.touched) > streamStateTTL {
+			delete(states, id)
+		}
+	}
+	for len(states) >= maxStreamStates {
+		oldestID := ""
+		var oldest time.Time
+		for id, st := range states {
+			if oldestID == "" || st.touched.Before(oldest) {
+				oldestID, oldest = id, st.touched
+			}
+		}
+		delete(states, oldestID)
+	}
 }
 
 func dropState(requestID string) {
@@ -75,11 +107,21 @@ func (st *streamState) reasoningItemID(index int) string {
 
 // rewriteDataLines 对分片里每个 JSON 负载调用 fn：既支持 SSE 的 "data: {...}" 行，
 // 也支持整块就是一个 JSON 对象（chat 分片由宿主在写出时才加 data: 前缀）。
-// 未改动的行按原字节保留。
+// 未改动的行按原字节保留；不是合法 JSON 的负载不交给 fn，改写结果不合法时丢弃改写。
 func rewriteDataLines(body []byte, fn func(payload []byte) ([]byte, bool)) ([]byte, bool) {
+	safe := func(payload []byte) ([]byte, bool) {
+		if !gjson.ValidBytes(payload) {
+			return payload, false
+		}
+		out, changed := fn(payload)
+		if !changed || !json.Valid(out) {
+			return payload, false
+		}
+		return out, true
+	}
 	trimmed := bytes.TrimSpace(body)
 	if len(trimmed) > 0 && trimmed[0] == '{' {
-		if out, changed := fn(trimmed); changed {
+		if out, changed := safe(trimmed); changed {
 			return out, true
 		}
 		return body, false
@@ -98,7 +140,7 @@ func rewriteDataLines(body []byte, fn func(payload []byte) ([]byte, bool)) ([]by
 		if bytes.HasSuffix(line, []byte("\r")) {
 			end--
 		}
-		out, changed := fn(line[start:end])
+		out, changed := safe(line[start:end])
 		if !changed {
 			continue
 		}
@@ -175,6 +217,8 @@ func patchResponsesEvent(st *streamState, root gjson.Result, payload []byte) ([]
 		if root.Get("response").IsObject() {
 			if !root.Get("response.created_at").Exists() {
 				p.set("response.created_at", time.Now().Unix())
+			} else if eventType == "response.created" {
+				noteNative("response.created_at")
 			}
 			for i, item := range root.Get("response.output").Array() {
 				patchOutputItem(p, fmt.Sprintf("response.output.%d", i), item, i, true)
@@ -195,9 +239,13 @@ func patchResponsesEvent(st *streamState, root gjson.Result, payload []byte) ([]
 		index := int(root.Get("output_index").Int())
 		if root.Get("item_id").String() == "" {
 			p.set("item_id", st.reasoningItemID(index))
+		} else {
+			noteNative("reasoning_summary.item_id")
 		}
 		if !root.Get("summary_index").Exists() {
 			p.set("summary_index", 0)
+		} else {
+			noteNative("reasoning_summary.summary_index")
 		}
 	}
 	return p.out, p.fixes
@@ -217,6 +265,8 @@ func patchOutputItem(p *patcher, prefix string, item gjson.Result, index int, do
 		}
 		if !item.Get("status").Exists() {
 			p.set(prefix+".status", status)
+		} else {
+			noteNative("function_call.status")
 		}
 	case "message":
 		if item.Get("id").String() == "" {
@@ -226,7 +276,12 @@ func patchOutputItem(p *patcher, prefix string, item gjson.Result, index int, do
 			p.set(prefix+".status", status)
 		}
 		for ci, part := range item.Get("content").Array() {
-			if part.Get("type").String() == "output_text" && !part.Get("annotations").IsArray() {
+			if part.Get("type").String() != "output_text" {
+				continue
+			}
+			if part.Get("annotations").IsArray() {
+				noteNative("message.annotations")
+			} else {
 				p.set(fmt.Sprintf("%s.content.%d.annotations", prefix, ci), []any{})
 			}
 		}
@@ -255,7 +310,11 @@ func patchResponsesObject(body []byte) ([]byte, int) {
 
 // normalizeChatChunk 把 chat/completions 流里的 tool_calls[].index 映射成从 0 开始的连续编号。
 // 宿主转换器直接用 Interactions 步骤下标做 index，前面有思考步骤时第一个工具调用就是 1。
+// 映射依赖同一请求跨分片的状态，拿不到 RequestID 时宁可不改，避免不同分片各自从 0 编号撞号。
 func normalizeChatChunk(requestID string, body []byte) ([]byte, bool) {
+	if requestID == "" {
+		return body, false
+	}
 	finished := false
 	var out []byte
 	var changed bool
@@ -273,10 +332,15 @@ func normalizeChatChunk(requestID string, body []byte) ([]byte, bool) {
 						continue
 					}
 					original := int(index.Int())
-					mapped, ok := st.chatIndexes[original]
+					indexes := st.chatIndexes[ci]
+					if indexes == nil {
+						indexes = map[int]int{}
+						st.chatIndexes[ci] = indexes
+					}
+					mapped, ok := indexes[original]
 					if !ok {
-						mapped = len(st.chatIndexes)
-						st.chatIndexes[original] = mapped
+						mapped = len(indexes)
+						indexes[original] = mapped
 					}
 					if mapped != original {
 						p.set(fmt.Sprintf("choices.%d.delta.tool_calls.%d.index", ci, ti), mapped)

@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "plugins": [
+    {
+      "id": "cpa-devin-compat",
+      "name": "Devin Compat",
+      "description": "修复 opencode 等 AI SDK 客户端经 CPA 调用 Devin 模型时的工具调用报错与 prompt cache 失效（首字慢）：补齐 Responses 缺失字段、无会话头时补稳定会话 ID、展开 namespace 工具。",
+      "author": "szxypi",
+      "repository": "https://github.com/szxypi/cpa-devin-compat",
+      "homepage": "https://github.com/szxypi/cpa-devin-compat",
+      "license": "MIT",
+      "tags": ["Devin", "Responses", "Compatibility", "Request Interceptor"]
+    }
+  ]
+}

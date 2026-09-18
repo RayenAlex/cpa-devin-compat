@@ -2,3 +2,4 @@ dist/
 *.so
 *.h
 DEPLOYMENT.md
+/cpa-devin-compat
